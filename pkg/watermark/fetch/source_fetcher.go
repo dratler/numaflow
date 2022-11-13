@@ -1,3 +1,19 @@
+/*
+Copyright 2022 The Numaproj Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package fetch
 
 import (
@@ -42,9 +58,10 @@ func (e *sourceFetcher) GetHeadWatermark() processor.Watermark {
 		}
 	}
 	if epoch == math.MinInt64 {
-		return processor.Watermark(time.Time{})
+		// Use -1 as default watermark value to indicate there is no valid watermark yet.
+		return processor.Watermark(time.UnixMilli(-1))
 	}
-	return processor.Watermark(time.Unix(epoch, 0))
+	return processor.Watermark(time.UnixMilli(epoch))
 }
 
 // GetWatermark returns the lowest of the latest watermark of all the processors,
@@ -60,7 +77,7 @@ func (e *sourceFetcher) GetWatermark(_ isb.Offset) processor.Watermark {
 		}
 	}
 	if epoch == math.MaxInt64 {
-		return processor.Watermark(time.Time{})
+		epoch = -1
 	}
-	return processor.Watermark(time.Unix(epoch, 0))
+	return processor.Watermark(time.UnixMilli(epoch))
 }

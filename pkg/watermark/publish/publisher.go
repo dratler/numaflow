@@ -1,22 +1,35 @@
+/*
+Copyright 2022 The Numaproj Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package publish
 
 import (
 	"context"
-	"encoding/binary"
-	"errors"
 	"fmt"
-	"math"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"github.com/numaproj/numaflow/pkg/isb"
 	"github.com/numaproj/numaflow/pkg/shared/logging"
+	"github.com/numaproj/numaflow/pkg/watermark/ot"
 	"github.com/numaproj/numaflow/pkg/watermark/processor"
 	"github.com/numaproj/numaflow/pkg/watermark/store"
 	"go.uber.org/zap"
 )
 
-// Publisher interface defines how to publish Watermark for a ProcessorEntity.
+// Publisher interface defines how to publish Watermark for a ProcessorEntitier.
 type Publisher interface {
 	// PublishWatermark publishes the watermark.
 	PublishWatermark(processor.Watermark, isb.Offset)
@@ -28,13 +41,15 @@ type Publisher interface {
 
 // publish publishes the watermark for a processor entity.
 type publish struct {
-	ctx            context.Context
-	entity         processor.ProcessorEntitier
+	ctx    context.Context
+	entity processor.ProcessorEntitier
+	// heartbeatStore uses second as the time unit for the value
 	heartbeatStore store.WatermarkKVStorer
-	otStore        store.WatermarkKVStorer
-	log            *zap.SugaredLogger
-	headWatermark  processor.Watermark
-	opts           *publishOptions
+	// osStore uses millisecond as the time unit for the value
+	otStore       store.WatermarkKVStorer
+	log           *zap.SugaredLogger
+	headWatermark processor.Watermark
+	opts          *publishOptions
 }
 
 // NewPublish returns `Publish`.
@@ -70,7 +85,7 @@ func NewPublish(ctx context.Context, processorEntity processor.ProcessorEntitier
 	return p
 }
 
-// initialSetup inserts the default values as the ProcessorEntity starts emitting watermarks.
+// initialSetup inserts the default values as the ProcessorEntitier starts emitting watermarks.
 func (p *publish) initialSetup() {
 	p.headWatermark = p.loadLatestFromStore()
 }
@@ -82,25 +97,35 @@ func (p *publish) PublishWatermark(wm processor.Watermark, offset isb.Offset) {
 		wm = processor.Watermark(time.Time(wm).Add(-p.opts.delay))
 	}
 	// update p.headWatermark only if wm > p.headWatermark
-	if time.Time(wm).After(time.Time(p.headWatermark)) {
+	if wm.After(time.Time(p.headWatermark)) {
+		p.log.Debugw("New watermark is updated for the head watermark", zap.String("head", p.headWatermark.String()), zap.String("new", wm.String()))
 		p.headWatermark = wm
+	} else if wm.Before(time.Time(p.headWatermark)) {
+		p.log.Warnw("Skip publishing the new watermark because it's older than the current watermark", zap.String("head", p.headWatermark.String()), zap.String("new", wm.String()))
+		return
 	} else {
-		p.log.Infow("New watermark is ignored because it's older than the current watermark", zap.String("head", p.headWatermark.String()), zap.String("new", wm.String()))
+		p.log.Debugw("Skip publishing the new watermark because it's the same as the current watermark", zap.String("head", p.headWatermark.String()), zap.String("new", wm.String()))
 		return
 	}
 
-	// build key (we may or may not share the same OT bucket)
-	var key = p.entity.BuildOTWatcherKey(wm)
+	var key = p.entity.BuildOTWatcherKey()
 
-	// build value (offset)
-	value := make([]byte, 8)
+	// build value
 	var seq int64
-	if p.opts.isSource || p.opts.isSink { // For source and sink publisher, we dont' care about the offset, also the sequence of the offset might not be integer.
+	if p.opts.isSource || p.opts.isSink {
+		// For source and sink publisher, we don't care about the offset, also the sequence of the offset might not be integer.
 		seq = time.Now().UnixNano()
 	} else {
 		seq, _ = offset.Sequence()
 	}
-	binary.LittleEndian.PutUint64(value, uint64(seq))
+	var otValue = ot.Value{
+		Offset:    seq,
+		Watermark: wm.UnixMilli(),
+	}
+	value, err := otValue.EncodeToBytes()
+	if err != nil {
+		p.log.Errorw("Unable to publish watermark", zap.String("HB", p.heartbeatStore.GetStoreName()), zap.String("OT", p.otStore.GetStoreName()), zap.String("key", key), zap.Error(err))
+	}
 
 	for {
 		err := p.otStore.PutKV(p.ctx, key, value)
@@ -109,6 +134,7 @@ func (p *publish) PublishWatermark(wm processor.Watermark, offset isb.Offset) {
 			// TODO: better exponential backoff
 			time.Sleep(time.Millisecond * 250)
 		} else {
+			p.log.Debugw("New watermark published with offset", zap.Int64("head", p.headWatermark.UnixMilli()), zap.Int64("new", wm.UnixMilli()), zap.Int64("offset", seq))
 			break
 		}
 	}
@@ -117,26 +143,21 @@ func (p *publish) PublishWatermark(wm processor.Watermark, offset isb.Offset) {
 // loadLatestFromStore loads the latest watermark stored in the watermark store.
 // TODO: how to repopulate if the processing unit is down for a really long time?
 func (p *publish) loadLatestFromStore() processor.Watermark {
-	// TODO: this is too much.
-	var watermarks = p.getAllOTKeysFromBucket()
-	var latestWatermark int64 = math.MinInt64
-
-	// skip all entries that do not match the prefix if we are sharing bucket
-
-	for _, wm := range watermarks {
-		epoch, skip, err := p.entity.ParseOTWatcherKey(wm)
-		if skip {
-			continue
-		}
-		if err != nil {
-			p.log.Errorw("Invalid epoch time string", zap.Error(err))
-			continue
-		}
-		if latestWatermark < epoch {
-			latestWatermark = epoch
-		}
+	var (
+		timeWatermark = time.UnixMilli(-1)
+		key           = p.entity.BuildOTWatcherKey()
+	)
+	byteValue, err := p.otStore.GetValue(p.ctx, key)
+	if err != nil {
+		p.log.Errorw("Unable to load latest watermark from ot store (failed to get value from ot store)", zap.String("OT", p.otStore.GetStoreName()), zap.String("processorEntity", p.entity.GetID()), zap.Error(err))
+		return processor.Watermark(timeWatermark)
 	}
-	var timeWatermark = time.Unix(latestWatermark, 0)
+	otValue, err := ot.DecodeToOTValue(byteValue)
+	if err != nil {
+		p.log.Errorw("Unable to load latest watermark from ot store (failed to decode ot value)", zap.String("OT", p.otStore.GetStoreName()), zap.String("processorEntity", p.entity.GetID()), zap.Error(err))
+		return processor.Watermark(timeWatermark)
+	}
+	timeWatermark = time.UnixMilli(otValue.Watermark)
 	return processor.Watermark(timeWatermark)
 }
 
@@ -148,7 +169,7 @@ func (p *publish) GetLatestWatermark() processor.Watermark {
 func (p *publish) publishHeartbeat() {
 	ticker := time.NewTicker(time.Second * time.Duration(p.opts.podHeartbeatRate))
 	defer ticker.Stop()
-	p.log.Infow("Refreshing ActiveProcessors ticker started")
+	p.log.Infow("Publishing Heartbeat ticker started")
 	for {
 		select {
 		case <-p.ctx.Done():
@@ -169,21 +190,13 @@ func (p *publish) StopPublisher() {
 	//   - remove itself from heartbeat bucket
 
 	p.log.Infow("Stopping publisher", zap.String("bucket", p.heartbeatStore.GetStoreName()))
-	if !p.entity.IsOTBucketShared() {
-		p.log.Warnw("Non sharing of bucket is not supported by controller as of today", zap.String("bucket", p.heartbeatStore.GetStoreName()))
-	}
 
 	// clean up heartbeat bucket
 	err := p.heartbeatStore.DeleteKey(p.ctx, p.entity.GetID())
 	if err != nil {
 		p.log.Errorw("Failed to delete the key in the heartbeat bucket", zap.String("bucket", p.heartbeatStore.GetStoreName()), zap.String("key", p.entity.GetID()), zap.Error(err))
 	}
-}
 
-func (p *publish) getAllOTKeysFromBucket() []string {
-	keys, err := p.otStore.GetAllKeys(p.ctx)
-	if err != nil && !errors.Is(err, nats.ErrNoKeysFound) {
-		p.log.Fatalw("Failed to get the keys", zap.String("bucket", p.heartbeatStore.GetStoreName()), zap.Error(err))
-	}
-	return keys
+	p.otStore.Close()
+	p.heartbeatStore.Close()
 }
